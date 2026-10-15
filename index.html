@@ -200,7 +200,8 @@ table.cmds td:first-child { font-weight: 700; white-space: nowrap; padding-right
 
   <div class="panel">
     <h2>Voice</h2>
-    <div class="field"><label for="voiceSel">Reading voice</label><select id="voiceSel"></select></div>
+    <div class="field"><label for="voiceSel">Reading voice</label><select id="voiceSel"></select>
+      <p class="muted" style="font-size:.9rem">Voices marked “natural” sound best. Picking one plays a sample. <span id="voiceHint"></span></p></div>
     <div class="field"><label for="rate">Speaking speed <span id="rateVal" class="muted"></span></label>
       <input type="range" id="rate" min="0.7" max="1.4" step="0.05"></div>
     <div class="row"><button type="button" class="ghost" id="testVoice">Test voice</button><button type="button" class="ghost" id="checkBtn">Sound and mic check</button></div>
@@ -322,16 +323,36 @@ let speakToken = 0;
 const keep = [];          // Chrome stops firing onend if an utterance gets garbage-collected
 const spokenChunks = [];  // the last few things the phone said, so the mic can ignore its own voice
 let ttsStarted = false, lastTtsError = "";
-// Only force a voice the user picked; otherwise let the phone use its default voice for British English.
-function pickVoice() { return prefs.voice ? voices.find(v => v.name === prefs.voice) || null : null; }
+// Novelty voices that ship with Apple devices; never pick or list these.
+const NOVELTY = /\b(albert|bad news|bahh|bells|boing|bubbles|cellos|good news|jester|organ|superstar|trinoids|whisper|wobble|zarvox|fred|junior|ralph|kathy|grandma|grandpa|eddy|flo|reed|rocko|sandy|shelley)\b/i;
+// Rank voices so "Automatic" finds the most natural one the device offers to web pages.
+function voiceScore(v) {
+  let s = 0;
+  // iPhone names don't always say "Enhanced"; the voiceURI does (com.apple.voice.premium.en-GB.Malcolm)
+  const id = `${v.name} ${v.voiceURI || ""}`;
+  if (/premium/i.test(id)) s += 60;
+  else if (/enhanced|neural|natural/i.test(id)) s += 45;
+  if (/online/i.test(v.name)) s += 10;
+  if (/^google/i.test(v.name)) s += 20;
+  const lang = v.lang.replace("_", "-");
+  if (lang === "en-GB") s += 8; else if (/^en-(IE|AU|NZ)/i.test(lang)) s += 5; else if (/^en-US/i.test(lang)) s += 3;
+  if (v.default) s += 4;
+  if (/^daniel\b/i.test(v.name) && !/enhanced|premium/i.test(id)) s -= 12; // the flat, robotic compact British voice
+  return s;
+}
+function bestVoice() { return voices.slice().sort((a, b) => voiceScore(b) - voiceScore(a))[0] || null; }
+// A voice the user picked wins; otherwise the best-sounding English voice on this device.
+function pickVoice() { return (prefs.voice && voices.find(v => v.name === prefs.voice)) || bestVoice(); }
 function loadVoices() {
   if (!synth) return;
-  voices = synth.getVoices().filter(v => /^en/i.test(v.lang));
+  voices = synth.getVoices().filter(v => /^en/i.test(v.lang) && !NOVELTY.test(v.name))
+    .sort((a, b) => voiceScore(b) - voiceScore(a) || a.name.localeCompare(b.name));
   const sel = $("voiceSel");
   sel.innerHTML = "";
-  const auto = document.createElement("option"); auto.value = ""; auto.textContent = "Automatic (device default)"; sel.appendChild(auto);
-  voices.forEach(v => { const o = document.createElement("option"); o.value = v.name; o.textContent = `${v.name} (${v.lang})`; sel.appendChild(o); });
-  sel.value = pickVoice() ? prefs.voice : "";
+  const best = bestVoice();
+  const auto = document.createElement("option"); auto.value = ""; auto.textContent = best ? `Automatic: best on this device (${best.name})` : "Automatic (device default)"; sel.appendChild(auto);
+  voices.forEach(v => { const o = document.createElement("option"); o.value = v.name; o.textContent = `${v.name} (${v.lang})${voiceScore(v) >= 45 ? " · natural" : ""}`; sel.appendChild(o); });
+  sel.value = prefs.voice && voices.some(v => v.name === prefs.voice) ? prefs.voice : "";
 }
 function speakify(t) {
   return String(t)
@@ -918,7 +939,7 @@ function wire() {
   $("bargeIn").onchange = e => { prefs.bargeIn = e.target.checked; savePrefs(); };
   $("brief").onchange = e => { prefs.brief = e.target.checked; savePrefs(); };
   $("rate").oninput = e => { prefs.rate = +e.target.value; savePrefs(); $("rateVal").textContent = prefs.rate.toFixed(2) + "×"; };
-  $("voiceSel").onchange = e => { prefs.voice = e.target.value; savePrefs(); };
+  $("voiceSel").onchange = e => { prefs.voice = e.target.value; savePrefs(); speak("This is how I'll read your questions."); };
   $("testVoice").onclick = () => speak("Question 1. Which of the following is a depository institution? A. Insurance companies. B. Credit unions.");
   $("checkBtn").onclick = runCheck;
   $("startBtn").onclick = startDrive;
@@ -947,6 +968,7 @@ function wire() {
     else if (k === " ") { e.preventDefault(); handle({ cmd: paused ? "resume" : "pause" }); }
   });
   if (synth) { loadVoices(); synth.onvoiceschanged = loadVoices; }
+  if (IOS) $("voiceHint").textContent = "For a better iPhone voice: Settings, Accessibility, Read & Speak, Voices, English. Download a Premium or Enhanced voice, then reload this page. Siri voices can't be used by websites.";
 }
 wire(); syncSetup(); updateMicNote();
 // Ask about the microphone once without starting anything, so we know before the drive whether voice will work.
