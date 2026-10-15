@@ -94,6 +94,10 @@ select { min-height: 44px; border-radius: 10px; border: 2px solid var(--line); b
 table.cmds { width: 100%; border-collapse: collapse; font-size: .95rem; }
 table.cmds td { padding: 8px 6px; border-top: 1px solid var(--line); vertical-align: top; }
 table.cmds td:first-child { font-weight: 700; white-space: nowrap; padding-right: 14px; }
+.checks { display: grid; gap: 8px; font-size: .95rem; }
+.chk { padding: 10px 12px; border-radius: 10px; background: var(--sunk); border-left: 4px solid var(--line); overflow-wrap: anywhere; }
+.chk.ok { border-color: var(--go); } .chk.bad { border-color: var(--stop); } .chk.warn { border-color: var(--accent); }
+.chk span { display: block; color: var(--muted); }
 .ghost { background: none; border: 2px solid var(--line); border-radius: 10px; min-height: 44px; padding: 6px 14px; font-weight: 700; }
 .danger { color: var(--stop); }
 
@@ -197,7 +201,8 @@ table.cmds td:first-child { font-weight: 700; white-space: nowrap; padding-right
     <div class="field"><label for="voiceSel">Reading voice</label><select id="voiceSel"></select></div>
     <div class="field"><label for="rate">Speaking speed <span id="rateVal" class="muted"></span></label>
       <input type="range" id="rate" min="0.7" max="1.4" step="0.05"></div>
-    <div class="row"><button type="button" class="ghost" id="testVoice">Test voice</button></div>
+    <div class="row"><button type="button" class="ghost" id="testVoice">Test voice</button><button type="button" class="ghost" id="checkBtn">Sound and mic check</button></div>
+    <div class="checks" id="checkOut" hidden></div>
   </div>
 
   <button type="button" class="start" id="startBtn">Start drive</button>
@@ -230,6 +235,7 @@ table.cmds td:first-child { font-weight: 700; white-space: nowrap; padding-right
     <span class="where" id="where"></span>
     <span class="score"><span class="r" id="sR">0 ✓</span><span class="w" id="sW">0 ✗</span></span>
   </div>
+  <div class="notice" id="driveNote" hidden></div>
   <div class="lamp" id="lamp" data-s="idle"><span class="dot"></span><span class="state" id="lampText">Ready</span><span class="heard" id="heard"></span></div>
   <div class="panel" id="qpanel">
     <details class="ctx" id="ctxBox" hidden><summary>Scenario</summary><p id="ctxText" style="margin-top:8px"></p></details>
@@ -305,18 +311,18 @@ const isMistake = q => { const s = stats[q.id]; return s && s.wrong > 0 && s.box
 const synth = window.speechSynthesis;
 let voices = [];
 let speakToken = 0;
-function pickVoice() {
-  if (!voices.length) return null;
-  return voices.find(v => v.name === prefs.voice) || voices.find(v => v.lang === "en-GB") || voices.find(v => /^en/.test(v.lang)) || voices[0];
-}
+const keep = [];          // Chrome stops firing onend if an utterance gets garbage-collected
+let ttsStarted = false, lastTtsError = "";
+// Only force a voice the user picked; otherwise let the phone use its default voice for British English.
+function pickVoice() { return prefs.voice ? voices.find(v => v.name === prefs.voice) || null : null; }
 function loadVoices() {
   if (!synth) return;
   voices = synth.getVoices().filter(v => /^en/i.test(v.lang));
   const sel = $("voiceSel");
   sel.innerHTML = "";
+  const auto = document.createElement("option"); auto.value = ""; auto.textContent = "Automatic (device default)"; sel.appendChild(auto);
   voices.forEach(v => { const o = document.createElement("option"); o.value = v.name; o.textContent = `${v.name} (${v.lang})`; sel.appendChild(o); });
-  const v = pickVoice(); if (v) sel.value = v.name;
-  if (!voices.length) { const o = document.createElement("option"); o.textContent = "Default voice"; sel.appendChild(o); }
+  sel.value = pickVoice() ? prefs.voice : "";
 }
 function speakify(t) {
   return String(t)
@@ -340,10 +346,11 @@ function chunk(text) {
   if (cur.trim()) out.push(cur);
   return out.map(s => s.trim()).filter(Boolean);
 }
+let first = true; // the very first utterance must run inside the tap for iPhone
 function speak(text) {
   const token = ++speakToken;
   if (!synth) return Promise.resolve(true);
-  synth.cancel();
+  if (synth.speaking || synth.pending) synth.cancel();
   const parts = chunk(speakify(text));
   return new Promise(resolve => {
     let i = 0;
@@ -353,23 +360,55 @@ function speak(text) {
       const part = parts[i++];
       const u = new SpeechSynthesisUtterance(part);
       const v = pickVoice(); if (v) { u.voice = v; u.lang = v.lang; } else u.lang = "en-GB";
-      u.rate = prefs.rate;
-      let moved = false;
-      const go = () => { if (moved) return; moved = true; clearTimeout(watchdog); setTimeout(next, 120); };
-      u.onend = go; u.onerror = go;
+      u.rate = prefs.rate; u.volume = 1;
+      keep.push(u); if (keep.length > 30) keep.shift();
+      let moved = false, started = false;
+      const go = () => { if (moved) return; moved = true; clearTimeout(watchdog); clearTimeout(startCheck); setTimeout(next, 120); };
+      u.onstart = () => { started = true; ttsStarted = true; soundWarning(false); };
+      u.onend = go;
+      u.onerror = e => { if (e.error !== "interrupted" && e.error !== "canceled") lastTtsError = e.error || "error"; go(); };
       // some engines never fire onend; never hang the drive
       const watchdog = setTimeout(go, 2500 + part.length * 110 / prefs.rate);
+      const startCheck = setTimeout(() => { if (!started && !moved && token === speakToken) soundWarning(true); }, 4000);
+      try { synth.resume(); } catch {}
       synth.speak(u);
     };
-    next();
+    // Chrome silently drops a speak() issued straight after cancel(), so leave a short gap
+    if (first) { first = false; next(); } else setTimeout(next, 80);
   });
 }
 function hush() { speakToken++; if (synth) synth.cancel(); }
+function soundWarning(on) {
+  const n = $("driveNote"); if (!n) return;
+  if (on) { n.hidden = false; n.textContent = "The phone isn't reading aloud. Turn the media volume up" + (/iPhone|iPad/.test(navigator.userAgent) ? ", switch off silent mode (side switch)" : "") + ", and run the sound and mic check on the setup screen." + (lastTtsError ? ` (Error: ${lastTtsError})` : ""); }
+  else if (n.dataset.kind !== "mic") n.hidden = true;
+}
 
 /* ---------- speech in ---------- */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let voiceIn = SR ? "unknown" : "none";   // unknown | ok | blocked | none
-let rec = null;
+let rec = null, lastSrError = "", srFails = 0;
+const SR_HELP = {
+  "not-allowed": "Microphone blocked for this site. Tap the icon next to the web address, allow Microphone, then reload.",
+  "service-not-allowed": /iPhone|iPad/.test(navigator.userAgent) ? "iPhone speech recognition is off. Turn on Settings, Siri, and also Settings, General, Keyboard, Enable Dictation." : "Speech recognition isn't allowed in this browser. Use Chrome.",
+  "audio-capture": "No microphone found. Check the phone or laptop microphone isn't in use by another app.",
+  "network": "Speech recognition needs an internet connection (Chrome sends audio to Google to recognise it).",
+  "language-not-supported": "This browser can't recognise British English."
+};
+async function ensureMic() {
+  if (!SR) return "none";
+  if (!window.isSecureContext) return "insecure";
+  if (!navigator.mediaDevices?.getUserMedia) return "unknown";
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+    s.getTracks().forEach(tr => tr.stop());
+    voiceIn = "ok"; return "ok";
+  } catch (e) {
+    if (e.name === "NotAllowedError" || e.name === "SecurityError") { voiceIn = "blocked"; lastSrError = "not-allowed"; return "denied"; }
+    if (e.name === "NotFoundError") { voiceIn = "blocked"; lastSrError = "audio-capture"; return "nomic"; }
+    return e.name || "error";
+  }
+}
 function listenOnce() {
   return new Promise(resolve => {
     if (!SR || voiceIn === "blocked") return resolve(null);
@@ -377,16 +416,20 @@ function listenOnce() {
     try { r = new SR(); } catch { voiceIn = "blocked"; return resolve(null); }
     r.lang = "en-GB"; r.interimResults = false; r.continuous = false; r.maxAlternatives = 5;
     let done = false;
-    const finish = v => { if (done) return; done = true; rec = null; resolve(v); };
+    const finish = v => { if (done) return; done = true; clearTimeout(guard); rec = null; resolve(v); };
+    // some browsers never report back when the speech service is unreachable
+    const guard = setTimeout(() => { try { r.abort(); } catch {} lastSrError = lastSrError || "no response from speech service"; srFails++; finish(srFails >= 4 ? null : []); }, 15000);
     r.onresult = e => {
-      voiceIn = "ok";
+      voiceIn = "ok"; srFails = 0; lastSrError = "";
       const res = e.results[e.results.length - 1];
       const alts = []; for (let i = 0; i < res.length; i++) alts.push(res[i].transcript);
       finish(alts);
     };
     r.onerror = e => {
-      if (e.error === "not-allowed" || e.error === "service-not-allowed" || e.error === "audio-capture") { voiceIn = "blocked"; updateMicNote(); finish(null); }
-      else finish([]);
+      if (e.error === "no-speech" || e.error === "aborted") return finish([]);
+      lastSrError = e.error; srFails++;
+      if (e.error === "not-allowed" || e.error === "service-not-allowed" || e.error === "audio-capture" || srFails >= 4) { voiceIn = "blocked"; updateMicNote(); micProblem(); finish(null); }
+      else setTimeout(() => finish([]), 800);
     };
     r.onend = () => finish([]);
     rec = r;
@@ -394,6 +437,11 @@ function listenOnce() {
   });
 }
 function stopListening() { if (rec) { try { rec.abort(); } catch {} rec = null; } }
+function micProblem() {
+  const n = $("driveNote"); if (!n) return;
+  n.hidden = false; n.dataset.kind = "mic";
+  n.textContent = "Voice answers stopped: " + (SR_HELP[lastSrError] || `speech recognition error "${lastSrError}".`) + " You can keep going by tapping the letter buttons.";
+}
 
 /* ---------- understanding what was said ---------- */
 const STRONG = { alpha: "A", alfa: "A", bravo: "B", charlie: "C", delta: "D", echo: "E", a: "A", b: "B", c: "C", d: "D", e: "E" };
@@ -652,6 +700,53 @@ function handle(p) {
   }
 }
 
+/* ---------- sound and mic check ---------- */
+async function runCheck() {
+  const out = $("checkOut"); out.hidden = false; out.innerHTML = "";
+  const line = (state, label, detail) => {
+    const d = document.createElement("div"); d.className = "chk " + (state === true ? "ok" : state === false ? "bad" : "warn");
+    const s = document.createElement("strong"); const sp = document.createElement("span");
+    d.append(s, sp); out.appendChild(d);
+    const set = (st, lb, dt) => { d.className = "chk " + (st === true ? "ok" : st === false ? "bad" : "warn"); s.textContent = (st === true ? "✓ " : st === false ? "✗ " : "… ") + lb; sp.textContent = dt || ""; };
+    set(state, label, detail); return set;
+  };
+  // speech must start inside the tap on iPhone, so do it first
+  const sayLine = line(null, "Read-aloud", "Speaking a test sentence now…");
+  const spoke = new Promise(res => {
+    if (!synth) return res("unsupported");
+    if (synth.speaking || synth.pending) synth.cancel();
+    const u = new SpeechSynthesisUtterance("Sound check. If you can hear this, read aloud is working.");
+    const v = pickVoice(); if (v) { u.voice = v; u.lang = v.lang; } else u.lang = "en-GB";
+    u.volume = 1; u.rate = prefs.rate; keep.push(u);
+    let started = false;
+    u.onstart = () => { started = true; ttsStarted = true; };
+    u.onend = () => res(started ? "ok" : "ended");
+    u.onerror = e => res("error " + (e.error || ""));
+    setTimeout(() => res(started ? "ok" : "silent"), 6000);
+    try { synth.resume(); } catch {}
+    synth.speak(u); first = false;
+  });
+  const ios = /iPhone|iPad/.test(navigator.userAgent);
+  const isFile = location.protocol === "file:";
+  line(window.isSecureContext && !isFile ? true : isFile ? null : false, "Web address", isFile ? "Opened as a downloaded file, which often blocks voice. Open https://logandups.github.io/drive-revision/ instead." : window.isSecureContext ? location.origin : "Not a secure https:// address, so the microphone is blocked.");
+  line(!!SR, "Voice answers in this browser", SR ? (ios ? "Safari on iPhone: needs Siri and Dictation switched on." : "Supported.") : "Not supported here. Use Chrome (Android or laptop) or Safari (iPhone). Firefox can't do it.");
+  const r = await spoke;
+  sayLine(r === "ok" || r === "ended", "Read-aloud", r === "ok" || r === "ended"
+    ? "Speech started. If you heard nothing, turn up the media volume" + (ios ? " and switch off silent mode" : "") + "."
+    : r === "unsupported" ? "This browser can't read aloud." : `Speech didn't start (${r}). Turn the volume up${ios ? ", switch off silent mode" : ""}, or pick a different voice above.`);
+  const micLine = line(null, "Microphone permission", "Asking… allow it if a pop-up appears.");
+  const m = await ensureMic();
+  micLine(m === "ok", "Microphone permission", { ok: "Allowed.", denied: SR_HELP["not-allowed"], nomic: SR_HELP["audio-capture"], insecure: "Needs the https:// link.", none: "Not available in this browser.", unknown: "This browser didn't say. Recognition will ask when it starts." }[m] || `Error: ${m}`);
+  if (SR && m !== "denied" && m !== "insecure" && m !== "nomic") {
+    voiceIn = voiceIn === "blocked" ? "unknown" : voiceIn; srFails = 0;
+    const hear = line(null, "Speech recognition", "Say “banana” now…");
+    const alts = await listenOnce();
+    if (alts && alts.length) hear(true, "Speech recognition", `Heard “${alts[0]}”. Voice answers work.`);
+    else hear(false, "Speech recognition", lastSrError ? (SR_HELP[lastSrError] || `Error: ${lastSrError}`) : "Heard nothing. Try again closer to the microphone.");
+  }
+  updateMicNote();
+}
+
 /* ---------- wake lock ---------- */
 let wake = null;
 async function holdWake() { try { if ("wakeLock" in navigator) wake = await navigator.wakeLock.request("screen"); } catch {} }
@@ -668,9 +763,15 @@ async function startDrive() {
   $("bPause").textContent = "Pause"; $("heard").textContent = "";
   show("drive");
   holdWake();
+  $("driveNote").hidden = true; $("driveNote").dataset.kind = "";
   // unlock speech on iOS within the tap
-  if (synth) { const u = new SpeechSynthesisUtterance(" "); u.volume = 0; synth.speak(u); }
-  askCurrent(`Starting a ${deck.length} question drive.${voiceIn === "blocked" || voiceIn === "none" ? " Voice answers aren't available here, so tap your answers." : ""}`);
+  if (synth) { const u = new SpeechSynthesisUtterance(" "); u.volume = 0; keep.push(u); synth.speak(u); first = false; }
+  // ask for the microphone now, so the permission pop-up appears straight away
+  setLamp("idle", "Checking mic");
+  const mic = await ensureMic();
+  updateMicNote();
+  if (mic !== "ok" && mic !== "none") micProblem();
+  askCurrent(`Starting a ${deck.length} question drive.${voiceIn === "blocked" || voiceIn === "none" || !window.isSecureContext ? " Voice answers aren't working here, so tap your answers." : ""}`);
 }
 
 /* ---------- setup screen ---------- */
@@ -709,8 +810,9 @@ function syncSetup() {
 }
 function updateMicNote() {
   const n = $("micNote");
+  if (!window.isSecureContext) { n.className = "notice"; n.textContent = "Voice answers need the https:// web address (your GitHub Pages link). Opened as a file, the browser blocks the microphone."; return; }
   if (!SR) { n.className = "notice"; n.textContent = "This browser can read questions aloud but can't hear you. For voice answers, open this page in Chrome (Android) or Safari (iPhone) from a web address. You can still tap the big letter buttons."; return; }
-  if (voiceIn === "blocked") { n.className = "notice"; n.textContent = "Microphone is blocked here, so answers are by tap. For voice answers, open the page from its own web address and allow the microphone when asked."; return; }
+  if (voiceIn === "blocked") { n.className = "notice"; n.textContent = (SR_HELP[lastSrError] || "Microphone is blocked here, so answers are by tap.") + " Run the sound and mic check below to test again."; return; }
   if (voiceIn === "ok") { n.className = "notice ok"; n.textContent = "Microphone ready. Say A to E to answer."; return; }
   let framed = false; try { framed = window.self !== window.top; } catch { framed = true; }
   n.className = "notice";
@@ -731,6 +833,7 @@ function wire() {
   $("rate").oninput = e => { prefs.rate = +e.target.value; savePrefs(); $("rateVal").textContent = prefs.rate.toFixed(2) + "×"; };
   $("voiceSel").onchange = e => { prefs.voice = e.target.value; savePrefs(); };
   $("testVoice").onclick = () => speak("Question 1. Which of the following is a depository institution? A. Insurance companies. B. Credit unions.");
+  $("checkBtn").onclick = runCheck;
   $("startBtn").onclick = startDrive;
   $("againBtn").onclick = startDrive;
   $("homeBtn").onclick = () => { phase = "idle"; syncSetup(); show("setup"); };
