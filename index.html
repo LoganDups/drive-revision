@@ -306,6 +306,11 @@ const store = {
 let stats = store.get("dtr.stats", {});
 const prefs = Object.assign({ lectures: [1, 2, 3, 4, 5], sources: ["tutorial", "practice", "notes"], mode: "smart", count: 10, autoNext: true, autoExplain: false, bargeIn: true, brief: true, rate: 1, voice: "" }, store.get("dtr.prefs", {}));
 const savePrefs = () => store.set("dtr.prefs", prefs);
+const IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+// On iPhone, listening while speaking switches the sound to the quiet earpiece, so "talk over it" starts off there.
+if (IOS && !prefs.iosAudioFix) { prefs.bargeIn = false; prefs.iosAudioFix = true; savePrefs(); }
+// Safari 16.4+: tell iOS this page plays audio, so it uses the main speaker and Bluetooth rather than the earpiece.
+function audioMode(type) { try { if (navigator.audioSession && navigator.audioSession.type !== type) navigator.audioSession.type = type; } catch {} }
 const saveStats = () => store.set("dtr.stats", stats);
 const mastered = q => (stats[q.id]?.box || 0) >= 2;
 const isMistake = q => { const s = stats[q.id]; return s && s.wrong > 0 && s.box < 2; };
@@ -423,6 +428,7 @@ function listenOnce() {
     if (!SR || voiceIn === "blocked") return resolve(null);
     let r;
     try { r = new SR(); } catch { voiceIn = "blocked"; return resolve(null); }
+    if (IOS) audioMode(prefs.bargeIn ? "play-and-record" : "auto");
     r.lang = "en-GB"; r.interimResults = false; r.continuous = false; r.maxAlternatives = 5;
     let done = false;
     const finish = v => { if (done) return; done = true; clearTimeout(guard); rec = null; userTalking = false; resolve(v); };
@@ -442,11 +448,12 @@ function listenOnce() {
       else setTimeout(() => finish([]), 800);
     };
     r.onend = () => finish([]);
-    rec = r;
+    rec = r; r.__finish = finish;
     try { r.start(); } catch { finish([]); }
   });
 }
-function stopListening() { if (rec) { try { rec.abort(); } catch {} rec = null; } }
+// Abort the recogniser and settle its promise straight away; not every browser reports back after abort().
+function stopListening() { if (rec) { const r = rec; rec = null; try { r.abort(); } catch {} if (r.__finish) r.__finish([]); } }
 function micProblem() {
   const n = $("driveNote"); if (!n) return;
   n.hidden = false; n.dataset.kind = "mic";
@@ -491,13 +498,13 @@ function parseLetter(s, valid) {
 const FILLER = new Set(["a", "b", "c", "d", "e", "alpha", "alfa", "bravo", "charlie", "delta", "echo", "option", "answer", "letter",
   "is", "its", "it's", "i", "i'll", "ill", "think", "the", "um", "uh", "er", "erm", "go", "with", "say", "my", "it", "please", "ok", "okay"]);
 // True when what the mic heard is most likely the phone's own voice rather than the driver.
-function isEcho(text, p) {
+function isEcho(text, p, strict) {
   const toks = norm(text).split(" ").filter(Boolean);
   const spoken = new Set(spokenChunks.slice(-2).flatMap(c => norm(c).split(" ")));
   const content = toks.filter(w => !FILLER.has(w));
   if (content.length && content.filter(w => spoken.has(w)).length / content.length > 0.5) return true;
   // while it's talking, only trust clear letters ("B", "bravo"), not sound-alikes such as "see" or "the"
-  if (p && p.cmd === "answer") return !toks.some(w => STRONG[w]);
+  if (strict && p && p.cmd === "answer") return !toks.some(w => STRONG[w]);
   return false;
 }
 function parse(alts, valid) {
@@ -608,8 +615,13 @@ let speakingNow = false, speechEndedAt = 0, handover = false, loopFor = 0, loopO
 const voiceUsable = () => !!SR && voiceIn !== "blocked" && voiceIn !== "none";
 async function say(text, after) {
   const my = ++flow;
+  const wasListening = !!rec;
   stopListening();
   speakingNow = true;
+  if (IOS && !prefs.bargeIn) {
+    audioMode("playback");
+    if (wasListening && !first) { await new Promise(r => setTimeout(r, 300)); if (my !== flow) return; }
+  }
   setLamp("speaking", prefs.bargeIn && voiceUsable() ? "Speaking · talk any time" : undefined);
   if (prefs.bargeIn) listenLoop(my);
   const finished = await speak(text);
@@ -618,6 +630,7 @@ async function say(text, after) {
   if (!finished) return;
   // restart the mic cleanly so nothing it caught of the phone's own voice carries over
   if (rec) { handover = true; stopListening(); }
+  if (loopFor === my && voiceUsable()) setLamp(paused ? "paused" : "listening");
   if (after) return after(my);
   listenLoop(my);
 }
@@ -652,7 +665,8 @@ async function listenLoop(my, opts = {}) {
     handover = false;
     const valid = cur ? Object.keys(cur.options) : [];
     const p = parse(alts, valid);
-    if ((duringSpeech || speakingNow || Date.now() - speechEndedAt < 700) && isEcho(alts[0], p)) continue;
+    const strict = duringSpeech || speakingNow;
+    if ((strict || Date.now() - speechEndedAt < 500) && isEcho(alts[0], p, strict)) continue;
     $("heard").textContent = `Heard “${alts[0]}”` + (p ? (p.cmd === "answer" ? ` → ${p.letter}` : ` → ${p.cmd}`) : "");
     if (paused) { if (p && (p.cmd === "resume" || p.cmd === "next" || p.cmd === "repeat")) { loopFor = 0; return handle({ cmd: "resume" }); } continue; }
     if (p) {
@@ -790,14 +804,21 @@ async function runCheck() {
     ? "Speech started. If you heard nothing, turn up the media volume" + (ios ? " and switch off silent mode" : "") + "."
     : r === "unsupported" ? "This browser can't read aloud." : `Speech didn't start (${r}). Turn the volume up${ios ? ", switch off silent mode" : ""}, or pick a different voice above.`);
   const micLine = line(null, "Microphone permission", "Asking… allow it if a pop-up appears.");
-  const m = await ensureMic();
-  micLine(m === "ok", "Microphone permission", { ok: "Allowed.", denied: SR_HELP["not-allowed"], nomic: SR_HELP["audio-capture"], insecure: "Needs the https:// link.", none: "Not available in this browser.", unknown: "This browser didn't say. Recognition will ask when it starts." }[m] || `Error: ${m}`);
+  const m = IOS ? "ios" : await ensureMic();
+  micLine(m === "ok" ? true : m === "ios" ? null : false, "Microphone permission", { ios: "Safari asks when listening starts (next step). Tap Allow.", ok: "Allowed.", denied: SR_HELP["not-allowed"], nomic: SR_HELP["audio-capture"], insecure: "Needs the https:// link.", none: "Not available in this browser.", unknown: "This browser didn't say. Recognition will ask when it starts." }[m] || `Error: ${m}`);
   if (SR && m !== "denied" && m !== "insecure" && m !== "nomic") {
     voiceIn = voiceIn === "blocked" ? "unknown" : voiceIn; srFails = 0;
     const hear = line(null, "Speech recognition", "Say “banana” now…");
     const alts = await listenOnce();
     if (alts && alts.length) hear(true, "Speech recognition", `Heard “${alts[0]}”. Voice answers work.`);
     else hear(false, "Speech recognition", lastSrError ? (SR_HELP[lastSrError] || `Error: ${lastSrError}`) : "Heard nothing. Try again closer to the microphone.");
+    if (IOS) {
+      audioMode("playback");
+      await new Promise(r => setTimeout(r, 300));
+      const after = line(null, "Sound after listening", "Saying “Got it”…");
+      const ok = await speak("Got it. Sound still works after listening.");
+      after(ok && ttsStarted ? true : false, "Sound after listening", ok && ttsStarted ? "If you heard “Got it”, the iPhone switches back to the speaker correctly. If not, tell Claude." : "Speech didn't restart after the mic was used.");
+    }
   }
   updateMicNote();
 }
@@ -819,14 +840,23 @@ async function startDrive() {
   show("drive");
   holdWake();
   $("driveNote").hidden = true; $("driveNote").dataset.kind = "";
-  // unlock speech on iOS within the tap
+  const intro = n => `Starting a ${deck.length} question drive.${n ? " Voice answers aren't working here, so tap your answers." : ""}`;
+  if (IOS) {
+    // iPhone: speech only plays if it starts inside the tap, and opening the mic first can mute it.
+    // Safari asks for the microphone itself when listening begins.
+    audioMode("playback");
+    first = true;
+    askCurrent(intro(!SR || !window.isSecureContext));
+    return;
+  }
+  // unlock speech within the tap
   if (synth) { const u = new SpeechSynthesisUtterance(" "); u.volume = 0; keep.push(u); synth.speak(u); first = false; }
   // ask for the microphone now, so the permission pop-up appears straight away
   setLamp("idle", "Checking mic");
   const mic = await ensureMic();
   updateMicNote();
   if (mic !== "ok" && mic !== "none") micProblem();
-  askCurrent(`Starting a ${deck.length} question drive.${voiceIn === "blocked" || voiceIn === "none" || !window.isSecureContext ? " Voice answers aren't working here, so tap your answers." : ""}`);
+  askCurrent(intro(voiceIn === "blocked" || voiceIn === "none" || !window.isSecureContext));
 }
 
 /* ---------- setup screen ---------- */
