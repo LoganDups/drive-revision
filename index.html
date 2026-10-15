@@ -340,17 +340,15 @@ function voiceScore(v) {
   if (/^daniel\b/i.test(v.name) && !/enhanced|premium/i.test(id)) s -= 12; // the flat, robotic compact British voice
   return s;
 }
-function bestVoice() { return voices.slice().sort((a, b) => voiceScore(b) - voiceScore(a))[0] || null; }
-// A voice the user picked wins; otherwise the best-sounding English voice on this device.
-function pickVoice() { return (prefs.voice && voices.find(v => v.name === prefs.voice)) || bestVoice(); }
+// Only force a voice the user picked; otherwise let the phone use its own default voice.
+function pickVoice() { return prefs.voice ? voices.find(v => v.name === prefs.voice) || null : null; }
 function loadVoices() {
   if (!synth) return;
   voices = synth.getVoices().filter(v => /^en/i.test(v.lang) && !NOVELTY.test(v.name))
     .sort((a, b) => voiceScore(b) - voiceScore(a) || a.name.localeCompare(b.name));
   const sel = $("voiceSel");
   sel.innerHTML = "";
-  const best = bestVoice();
-  const auto = document.createElement("option"); auto.value = ""; auto.textContent = best ? `Automatic: best on this device (${best.name})` : "Automatic (device default)"; sel.appendChild(auto);
+  const auto = document.createElement("option"); auto.value = ""; auto.textContent = "Automatic (device default)"; sel.appendChild(auto);
   voices.forEach(v => { const o = document.createElement("option"); o.value = v.name; o.textContent = `${v.name} (${v.lang})${voiceScore(v) >= 45 ? " · natural" : ""}`; sel.appendChild(o); });
   sel.value = prefs.voice && voices.some(v => v.name === prefs.voice) ? prefs.voice : "";
 }
