@@ -192,6 +192,8 @@ table.cmds td:first-child { font-weight: 700; white-space: nowrap; padding-right
         <button type="button" data-v="999" id="c-all">All</button>
       </div>
     </div>
+    <label class="switch"><input type="checkbox" id="bargeIn"> Talk over it: answer, skip or explain while it's still reading</label>
+    <label class="switch"><input type="checkbox" id="brief"> Quick mode: no question numbers or reminders, just “Correct” when you're right</label>
     <label class="switch"><input type="checkbox" id="autoNext"> Move on automatically after a correct answer</label>
     <label class="switch"><input type="checkbox" id="autoExplain"> Read the full explanation automatically when I'm wrong</label>
   </div>
@@ -210,6 +212,7 @@ table.cmds td:first-child { font-weight: 700; white-space: nowrap; padding-right
   <div class="panel">
     <h2>What you can say</h2>
     <table class="cmds"><tbody>
+      <tr><td>Any time</td><td>You don't have to wait. Talk over the question or the explanation and it stops and acts straight away.</td></tr>
       <tr><td>“A” … “E”</td><td>Answer. If a letter is misheard, use “Alpha, Bravo, Charlie, Delta, Echo”, or “option B”.</td></tr>
       <tr><td>“Explain”</td><td>Full step-by-step reasoning. Works before or after you answer. “I don't know” does the same.</td></tr>
       <tr><td>“Repeat”</td><td>Read the question and options again. “Options” reads just the choices.</td></tr>
@@ -301,7 +304,7 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
 };
 let stats = store.get("dtr.stats", {});
-const prefs = Object.assign({ lectures: [1, 2, 3, 4, 5], sources: ["tutorial", "practice", "notes"], mode: "smart", count: 10, autoNext: true, autoExplain: false, rate: 1, voice: "" }, store.get("dtr.prefs", {}));
+const prefs = Object.assign({ lectures: [1, 2, 3, 4, 5], sources: ["tutorial", "practice", "notes"], mode: "smart", count: 10, autoNext: true, autoExplain: false, bargeIn: true, brief: true, rate: 1, voice: "" }, store.get("dtr.prefs", {}));
 const savePrefs = () => store.set("dtr.prefs", prefs);
 const saveStats = () => store.set("dtr.stats", stats);
 const mastered = q => (stats[q.id]?.box || 0) >= 2;
@@ -312,6 +315,7 @@ const synth = window.speechSynthesis;
 let voices = [];
 let speakToken = 0;
 const keep = [];          // Chrome stops firing onend if an utterance gets garbage-collected
+const spokenChunks = [];  // the last few things the phone said, so the mic can ignore its own voice
 let ttsStarted = false, lastTtsError = "";
 // Only force a voice the user picked; otherwise let the phone use its default voice for British English.
 function pickVoice() { return prefs.voice ? voices.find(v => v.name === prefs.voice) || null : null; }
@@ -340,7 +344,11 @@ function chunk(text) {
   const sentences = text.match(/[^.!?;]+[.!?;]*["”’)]*\s*/g) || [text];
   const out = []; let cur = "";
   for (let s of sentences) {
-    while (s.length > 220) { const cut = s.lastIndexOf(",", 200) > 60 ? s.lastIndexOf(",", 200) + 1 : 200; out.push(s.slice(0, cut)); s = s.slice(cut); }
+    while (s.length > 220) {
+      const comma = s.lastIndexOf(",", 200), space = s.lastIndexOf(" ", 200);
+      const cut = comma > 60 ? comma + 1 : space > 60 ? space + 1 : 200;
+      out.push(s.slice(0, cut)); s = s.slice(cut);
+    }
     if ((cur + s).length > 220) { if (cur.trim()) out.push(cur); cur = s; } else cur += s;
   }
   if (cur.trim()) out.push(cur);
@@ -362,6 +370,7 @@ function speak(text) {
       const v = pickVoice(); if (v) { u.voice = v; u.lang = v.lang; } else u.lang = "en-GB";
       u.rate = prefs.rate; u.volume = 1;
       keep.push(u); if (keep.length > 30) keep.shift();
+      spokenChunks.push(part); if (spokenChunks.length > 3) spokenChunks.shift();
       let moved = false, started = false;
       const go = () => { if (moved) return; moved = true; clearTimeout(watchdog); clearTimeout(startCheck); setTimeout(next, 120); };
       u.onstart = () => { started = true; ttsStarted = true; soundWarning(false); };
@@ -387,7 +396,7 @@ function soundWarning(on) {
 /* ---------- speech in ---------- */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let voiceIn = SR ? "unknown" : "none";   // unknown | ok | blocked | none
-let rec = null, lastSrError = "", srFails = 0;
+let rec = null, lastSrError = "", srFails = 0, userTalking = false;
 const SR_HELP = {
   "not-allowed": "Microphone blocked for this site. Tap the icon next to the web address, allow Microphone, then reload.",
   "service-not-allowed": /iPhone|iPad/.test(navigator.userAgent) ? "iPhone speech recognition is off. Turn on Settings, Siri, and also Settings, General, Keyboard, Enable Dictation." : "Speech recognition isn't allowed in this browser. Use Chrome.",
@@ -416,7 +425,8 @@ function listenOnce() {
     try { r = new SR(); } catch { voiceIn = "blocked"; return resolve(null); }
     r.lang = "en-GB"; r.interimResults = false; r.continuous = false; r.maxAlternatives = 5;
     let done = false;
-    const finish = v => { if (done) return; done = true; clearTimeout(guard); rec = null; resolve(v); };
+    const finish = v => { if (done) return; done = true; clearTimeout(guard); rec = null; userTalking = false; resolve(v); };
+    r.onspeechstart = () => { userTalking = true; };
     // some browsers never report back when the speech service is unreachable
     const guard = setTimeout(() => { try { r.abort(); } catch {} lastSrError = lastSrError || "no response from speech service"; srFails++; finish(srFails >= 4 ? null : []); }, 15000);
     r.onresult = e => {
@@ -476,6 +486,19 @@ function parseLetter(s, valid) {
   // phonetic words anywhere, single letters at the end
   for (let i = t.length - 1; i >= 0; i--) { const w = t[i]; if (w.length > 1 && STRONG[w]) return ok(STRONG[w]); }
   const last = t[t.length - 1]; return ok(STRONG[last]);
+}
+// Words that carry no content: letters, phonetic letters and filler around an answer.
+const FILLER = new Set(["a", "b", "c", "d", "e", "alpha", "alfa", "bravo", "charlie", "delta", "echo", "option", "answer", "letter",
+  "is", "its", "it's", "i", "i'll", "ill", "think", "the", "um", "uh", "er", "erm", "go", "with", "say", "my", "it", "please", "ok", "okay"]);
+// True when what the mic heard is most likely the phone's own voice rather than the driver.
+function isEcho(text, p) {
+  const toks = norm(text).split(" ").filter(Boolean);
+  const spoken = new Set(spokenChunks.slice(-2).flatMap(c => norm(c).split(" ")));
+  const content = toks.filter(w => !FILLER.has(w));
+  if (content.length && content.filter(w => spoken.has(w)).length / content.length > 0.5) return true;
+  // while it's talking, only trust clear letters ("B", "bravo"), not sound-alikes such as "see" or "the"
+  if (p && p.cmd === "answer") return !toks.some(w => STRONG[w]);
+  return false;
 }
 function parse(alts, valid) {
   for (const a of alts) { const n = norm(a); for (const [name, re] of CMDS) if (re.test(n)) return { cmd: name, heard: a }; }
@@ -548,7 +571,7 @@ function setLamp(state, text) {
 }
 function show(id) { ["setup", "drive", "summary"].forEach(s => $(s).hidden = s !== id); window.scrollTo(0, 0); }
 
-function optionsSpeech(q) { return "The options are. " + Object.keys(q.options).map(L => `${L}: ${String(q.options[L]).trim().replace(/[.;]+$/, "")}.`).join(" "); }
+function optionsSpeech(q) { return (prefs.brief ? "" : "The options are. ") + Object.keys(q.options).map(L => `${L}: ${String(q.options[L]).trim().replace(/[.;]+$/, "")}.`).join(" "); }
 function stem(q) { const s = String(q.question).trim(); return /[.?!:]$/.test(s) ? s : s + "."; }
 function renderQ() {
   const q = cur;
@@ -579,37 +602,68 @@ function revealUI(chosen, verdictText, good) {
   $("sR").textContent = sess.right + " ✓"; $("sW").textContent = sess.wrong + " ✗";
 }
 
-/* Say something, then listen for a command. Every user action bumps `flow`, which cancels whatever was in progress. */
+/* Say something and listen at the same time, so the driver can interrupt ("barge in").
+   Every user action bumps `flow`, which cancels whatever was in progress. */
+let speakingNow = false, speechEndedAt = 0, handover = false, loopFor = 0, loopOpts = {};
+const voiceUsable = () => !!SR && voiceIn !== "blocked" && voiceIn !== "none";
 async function say(text, after) {
   const my = ++flow;
   stopListening();
-  setLamp("speaking");
+  speakingNow = true;
+  setLamp("speaking", prefs.bargeIn && voiceUsable() ? "Speaking · talk any time" : undefined);
+  if (prefs.bargeIn) listenLoop(my);
   const finished = await speak(text);
-  if (my !== flow || !finished) return;
+  if (my !== flow) return;
+  speakingNow = false; speechEndedAt = Date.now();
+  if (!finished) return;
+  // restart the mic cleanly so nothing it caught of the phone's own voice carries over
+  if (rec) { handover = true; stopListening(); }
   if (after) return after(my);
   listenLoop(my);
 }
+// After a correct answer: a short pause to say "explain", then move on by itself.
+function armWindow(my) {
+  const t0 = Date.now(), wait = prefs.brief ? 2500 : 4000;
+  const tick = () => {
+    if (my !== flow || !loopOpts.window) return;
+    if (userTalking) return setTimeout(tick, 600);
+    if (Date.now() - t0 >= wait) { loopOpts = {}; stopListening(); goNext(); }
+    else setTimeout(tick, 250);
+  };
+  setTimeout(tick, 250);
+}
 async function listenLoop(my, opts = {}) {
+  if (loopFor === my) { loopOpts = opts; if (opts.window) armWindow(my); return; }
+  loopFor = my; loopOpts = opts; if (opts.window) armWindow(my);
   while (my === flow) {
-    if (voiceIn === "blocked" || voiceIn === "none") { setLamp("tap"); return; }
-    setLamp(paused ? "paused" : "listening", paused ? "Paused · say resume" : undefined);
+    if (!voiceUsable()) { if (!speakingNow) setLamp("tap"); break; }
+    if (!speakingNow) setLamp(paused ? "paused" : "listening", paused ? "Paused · say resume" : undefined);
+    const duringSpeech = speakingNow;
     const alts = await listenOnce();
-    if (my !== flow) return;
-    if (alts === null) { setLamp("tap"); return; }
+    if (my !== flow) break;
+    if (alts === null) { if (!speakingNow) setLamp("tap"); break; }
     if (!alts.length) {
-      if (opts.window) return opts.onSilence();
+      if (handover) { handover = false; continue; }
+      if (speakingNow || loopOpts.window || paused) continue;
       silence++;
-      if (!paused && silence === 3) { silence = 0; return say(phase === "question" ? "Still there? Say a letter, A to E, or say repeat, or explain." : "Say next to continue, or explain for the full reasoning."); }
+      if (silence === 3) { silence = 0; loopFor = 0; return say(phase === "question" ? "Still there? Say a letter, A to E, or say repeat, or explain." : "Say next to continue, or explain for the full reasoning."); }
       continue;
     }
+    handover = false;
     const valid = cur ? Object.keys(cur.options) : [];
     const p = parse(alts, valid);
+    if ((duringSpeech || speakingNow || Date.now() - speechEndedAt < 700) && isEcho(alts[0], p)) continue;
     $("heard").textContent = `Heard “${alts[0]}”` + (p ? (p.cmd === "answer" ? ` → ${p.letter}` : ` → ${p.cmd}`) : "");
-    if (paused) { if (p && (p.cmd === "resume" || p.cmd === "next" || p.cmd === "repeat")) return handle({ cmd: "resume" }); continue; }
-    if (p) { silence = 0; return handle(p); }
-    if (opts.window) return opts.onSilence();
-    return say(`I heard ${alts[0]}. Say a letter, A to E, or say explain.`);
+    if (paused) { if (p && (p.cmd === "resume" || p.cmd === "next" || p.cmd === "repeat")) { loopFor = 0; return handle({ cmd: "resume" }); } continue; }
+    if (p) {
+      if (p.cmd === "answer" && phase !== "question" && speakingNow) continue; // don't cut the feedback off for a stray letter
+      silence = 0; loopFor = 0; return handle(p);
+    }
+    if (speakingNow || loopOpts.window) continue;
+    loopFor = 0;
+    return say(prefs.brief ? "Sorry, say a letter, or explain." : `I heard ${alts[0]}. Say a letter, A to E, or say explain.`);
   }
+  if (loopFor === my) loopFor = 0;
 }
 
 function askCurrent(intro) {
@@ -617,10 +671,10 @@ function askCurrent(intro) {
   renderQ();
   const q = cur;
   let t = intro ? intro + " " : "";
-  t += `Question ${idx + 1}. Lecture ${q.lecture}${q.source === "practice" ? ", practice question" : q.source === "notes" ? ", from your notes" : ""}. `;
-  if (q.context && q.group !== lastGroup) t += `This one uses a scenario. ${q.context} `;
+  if (!prefs.brief) t += `Question ${idx + 1}. Lecture ${q.lecture}${q.source === "practice" ? ", practice question" : q.source === "notes" ? ", from your notes" : ""}. `;
+  if (q.context && q.group !== lastGroup) t += `${prefs.brief ? "Scenario." : "This one uses a scenario."} ${q.context} `;
   lastGroup = q.group || null;
-  t += `${stem(q)} ${optionsSpeech(q)} Your answer?`;
+  t += `${stem(q)} ${optionsSpeech(q)}${prefs.brief ? "" : " Your answer?"}`;
   say(t);
 }
 function goNext() {
@@ -636,33 +690,34 @@ function explainNow() {
   if (phase === "question") {
     record(q, false); sess.wrong++; sess.missed.push(q);
     phase = "answered"; revealUI(null, `Answer: ${q.answer}`, false);
-    pre = `The correct answer is ${q.answer}. ${q.options[q.answer]}. `;
+    pre = `The correct answer is ${q.answer}. ${String(q.options[q.answer]).trim().replace(/[.;]+$/, "")}. `;
   }
   explained = true;
   $("longText").hidden = false; $("longText").textContent = q.explanation;
   $("keyText").hidden = !q.key; $("keyText").textContent = q.key ? "Remember: " + q.key : "";
   $("bExplain").classList.remove("hl");
-  say(`${pre}Here's the full explanation. ${q.explanation} ${q.key ? "The key thing to remember: " + q.key : ""} Say repeat to hear that again, or next to continue.`);
+  say(`${pre}${prefs.brief ? "" : "Here's the full explanation. "}${q.explanation} ${q.key ? "The key thing to remember: " + q.key : ""}${prefs.brief ? "" : " Say repeat to hear that again, or next to continue."}`);
 }
 function answer(L) {
   const q = cur;
-  if (phase !== "question") return say(`You've already answered this one. The answer was ${q.answer}. Say next, or explain.`);
+  if (phase !== "question") return say(prefs.brief ? `Already answered. It's ${q.answer}.` : `You've already answered this one. The answer was ${q.answer}. Say next, or explain.`);
   phase = "answered"; answeredLetter = L;
   const good = L === q.answer;
   record(q, good);
   if (good) sess.right++; else { sess.wrong++; sess.missed.push(q); }
   revealUI(L, good ? `Correct · ${L}` : `Not quite · you said ${L}, answer ${q.answer}`, good);
   if (good) {
-    if (prefs.autoNext) {
-      say(`Correct! ${q.short} Say explain to hear more, or I'll move on.`, my => listenLoop(my, { window: true, onSilence: () => { if (my === flow) goNext(); } }));
-    } else say(`Correct! ${q.short} Say next, or explain.`);
+    const msg = prefs.brief ? "Correct." : `Correct! ${q.short}`;
+    if (prefs.autoNext) say(prefs.brief ? msg : `${msg} Say explain to hear more, or I'll move on.`, my => listenLoop(my, { window: true }));
+    else say(prefs.brief ? msg : `${msg} Say next, or explain.`);
   } else {
-    if (prefs.autoExplain) { say(`Not quite, you said ${L}. ${q.short}`, () => explainNow()); }
-    else say(`Not quite, you said ${L}. ${q.short} Say explain for the full reasoning, or next to move on.`);
+    const msg = prefs.brief ? `No. ${q.short}` : `Not quite, you said ${L}. ${q.short}`;
+    if (prefs.autoExplain) say(msg, () => explainNow());
+    else say(prefs.brief ? msg : `${msg} Say explain for the full reasoning, or next to move on.`);
   }
 }
 function finish() {
-  hush(); stopListening(); flow++; phase = "done";
+  hush(); stopListening(); flow++; phase = "done"; speakingNow = false;
   releaseWake();
   const total = sess.right + sess.wrong;
   $("sumScore").textContent = `${sess.right} / ${total}`;
@@ -691,8 +746,8 @@ function handle(p) {
     case "options": paused = false; return say(optionsSpeech(q));
     case "scenario": paused = false; return say(q.context ? q.context + " " + stem(q) : "This question has no separate scenario. " + stem(q));
     case "next": paused = false; return goNext();
-    case "pause": paused = true; hush(); $("bPause").textContent = "Resume"; flow++; return listenLoop(flow);
-    case "resume": paused = false; $("bPause").textContent = "Pause"; return phase === "question" ? say(`${stem(q)} ${optionsSpeech(q)}`) : say("Say next, or explain.");
+    case "pause": paused = true; hush(); speakingNow = false; $("bPause").textContent = "Resume"; flow++; return listenLoop(flow);
+    case "resume": paused = false; $("bPause").textContent = "Pause"; return phase === "question" ? say(`${stem(q)} ${optionsSpeech(q)}`) : say(prefs.brief ? "Next, or explain?" : "Say next, or explain.");
     case "score": return say(`You have ${sess.right} right and ${sess.wrong} wrong. This is question ${idx + 1} of ${deck.length}.`);
     case "slower": prefs.rate = Math.max(.7, +(prefs.rate - .1).toFixed(2)); savePrefs(); syncSetup(); return say("Slower.");
     case "faster": prefs.rate = Math.min(1.4, +(prefs.rate + .1).toFixed(2)); savePrefs(); syncSetup(); return say("Faster.");
@@ -803,7 +858,7 @@ function syncSetup() {
   const mc = poolFor("mistakes").length;
   $("m-mistakes").textContent = `My mistakes (${mc})`;
   $("modeHelp").textContent = { smart: "Missed questions come back first, then new ones, then anything you haven't seen for a while.", order: "Works through each lecture from Question 1 and remembers where you stopped.", mistakes: "Only questions you've got wrong and haven't yet answered correctly twice in a row.", mock: `Like the real midterm: 5 questions from each chosen lecture (${prefs.lectures.length * 5} in all), unseen and missed ones first.` }[prefs.mode];
-  $("autoNext").checked = prefs.autoNext; $("autoExplain").checked = prefs.autoExplain;
+  $("autoNext").checked = prefs.autoNext; $("autoExplain").checked = prefs.autoExplain; $("bargeIn").checked = prefs.bargeIn; $("brief").checked = prefs.brief;
   $("rate").value = prefs.rate; $("rateVal").textContent = prefs.rate.toFixed(2) + "×";
   const total = Object.keys(stats).length, mAll = QB.filter(mastered).length;
   $("progressLine").textContent = total ? `${total} of ${QB.length} questions tried · ${mAll} mastered on this device` : "Progress is saved on this device.";
@@ -830,6 +885,8 @@ function wire() {
   });
   $("autoNext").onchange = e => { prefs.autoNext = e.target.checked; savePrefs(); };
   $("autoExplain").onchange = e => { prefs.autoExplain = e.target.checked; savePrefs(); };
+  $("bargeIn").onchange = e => { prefs.bargeIn = e.target.checked; savePrefs(); };
+  $("brief").onchange = e => { prefs.brief = e.target.checked; savePrefs(); };
   $("rate").oninput = e => { prefs.rate = +e.target.value; savePrefs(); $("rateVal").textContent = prefs.rate.toFixed(2) + "×"; };
   $("voiceSel").onchange = e => { prefs.voice = e.target.value; savePrefs(); };
   $("testVoice").onclick = () => speak("Question 1. Which of the following is a depository institution? A. Insurance companies. B. Credit unions.");
