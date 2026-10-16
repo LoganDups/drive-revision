@@ -310,8 +310,7 @@ const savePrefs = () => store.set("dtr.prefs", prefs);
 const IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 // On iPhone, listening while speaking switches the sound to the quiet earpiece, so "talk over it" starts off there.
 if (IOS && !prefs.iosAudioFix) { prefs.bargeIn = false; prefs.iosAudioFix = true; savePrefs(); }
-// Safari 16.4+: tell iOS this page plays audio, so it uses the main speaker and Bluetooth rather than the earpiece.
-function audioMode(type) { try { if (navigator.audioSession && navigator.audioSession.type !== type) navigator.audioSession.type = type; } catch {} }
+
 const saveStats = () => store.set("dtr.stats", stats);
 const mastered = q => (stats[q.id]?.box || 0) >= 2;
 const isMistake = q => { const s = stats[q.id]; return s && s.wrong > 0 && s.box < 2; };
@@ -379,35 +378,46 @@ function chunk(text) {
   return out.map(s => s.trim()).filter(Boolean);
 }
 let first = true; // the very first utterance must run inside the tap for iPhone
+// Hand the engine every chunk at once so it reads them back to back with no gaps.
+// (Chunks stay short because Chrome cuts off single utterances after about 15 seconds.)
 function speak(text) {
   const token = ++speakToken;
   if (!synth) return Promise.resolve(true);
-  if (synth.speaking || synth.pending) synth.cancel();
+  const wasBusy = synth.speaking || synth.pending;
+  if (wasBusy) synth.cancel();
   const parts = chunk(speakify(text));
   return new Promise(resolve => {
-    let i = 0;
-    const next = () => {
-      if (token !== speakToken) return resolve(false);
-      if (i >= parts.length) return resolve(true);
-      const part = parts[i++];
-      const u = new SpeechSynthesisUtterance(part);
-      const v = pickVoice(); if (v) { u.voice = v; u.lang = v.lang; } else u.lang = "en-GB";
-      u.rate = prefs.rate; u.volume = 1;
-      keep.push(u); if (keep.length > 30) keep.shift();
-      spokenChunks.push(part); if (spokenChunks.length > 3) spokenChunks.shift();
-      let moved = false, started = false;
-      const go = () => { if (moved) return; moved = true; clearTimeout(watchdog); clearTimeout(startCheck); setTimeout(next, 120); };
-      u.onstart = () => { started = true; ttsStarted = true; soundWarning(false); };
-      u.onend = go;
-      u.onerror = e => { if (e.error !== "interrupted" && e.error !== "canceled") lastTtsError = e.error || "error"; go(); };
-      // some engines never fire onend; never hang the drive
-      const watchdog = setTimeout(go, 2500 + part.length * 110 / prefs.rate);
-      const startCheck = setTimeout(() => { if (!started && !moved && token === speakToken) soundWarning(true); }, 4000);
+    if (!parts.length) return resolve(true);
+    let done = false, started = false, remaining = parts.length;
+    const finish = ok => { if (done) return; done = true; clearTimeout(watchdog); clearTimeout(startCheck); resolve(ok); };
+    // some engines never fire onend; never hang the drive
+    const watchdog = setTimeout(() => finish(token === speakToken), parts.reduce((n, p) => n + 2000 + p.length * 110 / prefs.rate, 0));
+    const startCheck = setTimeout(() => { if (!started && token === speakToken) soundWarning(true); }, 4000);
+    const queue = () => {
+      if (token !== speakToken) return finish(false);
       try { synth.resume(); } catch {}
-      synth.speak(u);
+      const v = pickVoice();
+      spokenChunks.push(parts[0]); if (spokenChunks.length > 3) spokenChunks.shift();
+      parts.forEach((part, i) => {
+        const u = new SpeechSynthesisUtterance(part);
+        if (v) { u.voice = v; u.lang = v.lang; } else u.lang = "en-GB";
+        u.rate = prefs.rate; u.volume = 1;
+        keep.push(u); if (keep.length > 60) keep.shift();
+        u.onstart = () => {
+          started = true; ttsStarted = true; soundWarning(false);
+          if (i > 0) { spokenChunks.push(part); if (spokenChunks.length > 3) spokenChunks.shift(); }
+        };
+        u.onend = () => { if (--remaining <= 0) finish(token === speakToken); };
+        u.onerror = e => {
+          if (e.error === "interrupted" || e.error === "canceled") return finish(false);
+          lastTtsError = e.error || "error";
+          if (--remaining <= 0) finish(token === speakToken);
+        };
+        synth.speak(u);
+      });
     };
-    // Chrome silently drops a speak() issued straight after cancel(), so leave a short gap
-    if (first) { first = false; next(); } else setTimeout(next, 80);
+    // Chrome can drop a speak() issued in the same instant as cancel(), so leave a tiny gap only then
+    if (first || !wasBusy) { first = false; queue(); } else setTimeout(queue, 50);
   });
 }
 function hush() { speakToken++; if (synth) synth.cancel(); }
@@ -447,7 +457,6 @@ function listenOnce() {
     if (!SR || voiceIn === "blocked") return resolve(null);
     let r;
     try { r = new SR(); } catch { voiceIn = "blocked"; return resolve(null); }
-    if (IOS) audioMode(prefs.bargeIn ? "play-and-record" : "auto");
     r.lang = "en-GB"; r.interimResults = false; r.continuous = false; r.maxAlternatives = 5;
     let done = false;
     const finish = v => { if (done) return; done = true; clearTimeout(guard); rec = null; userTalking = false; resolve(v); };
@@ -634,13 +643,8 @@ let speakingNow = false, speechEndedAt = 0, handover = false, loopFor = 0, loopO
 const voiceUsable = () => !!SR && voiceIn !== "blocked" && voiceIn !== "none";
 async function say(text, after) {
   const my = ++flow;
-  const wasListening = !!rec;
   stopListening();
   speakingNow = true;
-  if (IOS && !prefs.bargeIn) {
-    audioMode("playback");
-    if (wasListening && !first) { await new Promise(r => setTimeout(r, 300)); if (my !== flow) return; }
-  }
   setLamp("speaking", prefs.bargeIn && voiceUsable() ? "Speaking · talk any time" : undefined);
   if (prefs.bargeIn) listenLoop(my);
   const finished = await speak(text);
@@ -832,8 +836,6 @@ async function runCheck() {
     if (alts && alts.length) hear(true, "Speech recognition", `Heard “${alts[0]}”. Voice answers work.`);
     else hear(false, "Speech recognition", lastSrError ? (SR_HELP[lastSrError] || `Error: ${lastSrError}`) : "Heard nothing. Try again closer to the microphone.");
     if (IOS) {
-      audioMode("playback");
-      await new Promise(r => setTimeout(r, 300));
       const after = line(null, "Sound after listening", "Saying “Got it”…");
       const ok = await speak("Got it. Sound still works after listening.");
       after(ok && ttsStarted ? true : false, "Sound after listening", ok && ttsStarted ? "If you heard “Got it”, the iPhone switches back to the speaker correctly. If not, tell Claude." : "Speech didn't restart after the mic was used.");
@@ -863,7 +865,6 @@ async function startDrive() {
   if (IOS) {
     // iPhone: speech only plays if it starts inside the tap, and opening the mic first can mute it.
     // Safari asks for the microphone itself when listening begins.
-    audioMode("playback");
     first = true;
     askCurrent(intro(!SR || !window.isSecureContext));
     return;
